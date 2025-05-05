@@ -459,1240 +459,752 @@
     <!-- Restaurant data -->
     <script src="restaurant-data.js"></script>
     
-    <script>
-        // DOM elements
-        const transcript = document.getElementById('transcript');
-        const startButton = document.getElementById('startButton');
-        const statusElement = document.getElementById('status');
-        const microphoneIndicator = document.getElementById('microphoneIndicator');
-        const cartItemsElement = document.getElementById('cartItems');
-        const cartTotalElement = document.getElementById('cartTotal');
-        const itemCountElement = document.getElementById('itemCount');
-        const languageSelect = document.getElementById('languageSelect');
-        const textInput = document.getElementById('textInput');
-        const sendButton = document.getElementById('sendButton');
-        const checkoutButton = document.getElementById('checkoutButton');
-        const debugPanel = document.getElementById('debugPanel');
-        const debugLogs = document.getElementById('debugLogs');
-        const debugToggle = document.getElementById('debugToggle');
-        const clearLogs = document.getElementById('clearLogs');
-        
-        // State variables
-        let isConversationActive = false;
-        let cart = [];
-        let totalPrice = 0;
-        let currentLanguage = 'en';
-        let isDebugMode = false;
-        let sessionId = null;
-        let peerConnection = null;
-        let dataChannel = null;
-        let audioSender = null;
-        let audioReceiver = null;
-        let microphoneStream = null;
-        let audioContext = null;
-        let audioWorkletNode = null;
-        let audioDestination = null;
-        let audioReceiveContext = null;
-        let audioReceiveWorklet = null;
-        let isSpeaking = false;
+<script>
+    // DOM elements
+    // Client-side code
+let websocket = null;
+let isRecording = false;
+let clientId = null;
+let audioContext = null;
+let microphoneStream = null;
+let audioProcessor = null;
+let cart = [];
 
-        // Debug logging
-        function debugLog(message, data) {
-            const logTime = new Date().toLocaleTimeString();
-            const logMessage = `[${logTime}] ${message}`;
-            
-            if (data) {
-                console.log(logMessage, data);
-                
-                // Add to debug panel
-                if (isDebugMode) {
-                    const formattedData = typeof data === 'object' ? 
-                        JSON.stringify(data, null, 2) : data;
-                    
-                    debugLogs.innerHTML += `<div>${logMessage} ${formattedData}</div>`;
-                    debugLogs.scrollTop = debugLogs.scrollHeight;
-                }
-            } else {
-                console.log(logMessage);
-                
-                // Add to debug panel
-                if (isDebugMode) {
-                    debugLogs.innerHTML += `<div>${logMessage}</div>`;
-                    debugLogs.scrollTop = debugLogs.scrollHeight;
-                }
-            }
-        }
-        
-        // Debug panel toggle
-        debugToggle.addEventListener('click', () => {
-            isDebugMode = !isDebugMode;
-            debugPanel.classList.toggle('active');
-            debugToggle.textContent = isDebugMode ? 'Hide Debug Panel' : 'Show Debug Panel';
-        });
-        
-        // Clear logs button
-        clearLogs.addEventListener('click', () => {
-            debugLogs.innerHTML = '';
-        });
-        
-        // Initialize the application
-        async function initialize() {
-            debugLog('Initializing application...');
-            
-            try {
-                // Create WebRTC session
-                await createSession();
-                
-                // Enable UI elements
-                startButton.disabled = false;
-                updateStatus('Ready. Click "Start Conversation" to begin.');
-            } catch (error) {
-                console.error('Initialization error:', error);
-                updateStatus(`Error: ${error.message}`);
-            }
-        }
-        
-        // Create and initialize WebRTC session
-        async function createSession() {
-            debugLog('Creating WebRTC session...');
-            
-            try {
-                // Get session info from server
-                const response = await fetch('/api/create-session');
-                
-                if (!response.ok) {
-                    const error = await response.json();
-                    throw new Error(`Failed to create session: ${error.error || 'Unknown error'}`);
-                }
-                
-                const sessionData = await response.json();
-                debugLog('Session created:', sessionData);
-                
-                // Store session ID
-                sessionId = sessionData.session_id;
-                
-                // Setup WebRTC connection
-                await setupWebRTC(sessionData);
-                
-                // Configure session with language preference
-                await updateSessionConfiguration();
-                
-                return sessionId;
-            } catch (error) {
-                console.error('Error creating session:', error);
-                updateStatus(`Error: ${error.message}`);
-                throw error;
-            }
-        }
-        
-        // Setup WebRTC connection
-        async function setupWebRTC(sessionData) {
-            try {
-                debugLog('Setting up WebRTC connection...');
-                
-                // Check if we already have a peer connection
-                if (peerConnection) {
-                    debugLog('Closing existing peer connection...');
-                    peerConnection.close();
-                    peerConnection = null;
-                }
-                
-                // Create peer connection
-                const configuration = {
-                    iceServers: sessionData.ice_servers || [
-                        { urls: 'stun:stun.l.google.com:19302' }
-                    ]
-                };
-                
-                peerConnection = new RTCPeerConnection(configuration);
-                
-                // Setup data channel
-                dataChannel = peerConnection.createDataChannel('events', {
-                    ordered: true
-                });
-                
-                dataChannel.onopen = () => {
-                    debugLog('Data channel open');
-                };
-                
-                dataChannel.onmessage = (event) => {
-                    handleDataChannelMessage(event.data);
-                };
-                
-                dataChannel.onerror = (error) => {
-                    console.error('Data channel error:', error);
-                };
-                
-                dataChannel.onclose = () => {
-                    debugLog('Data channel closed');
-                };
-                
-                // Handle ICE candidate events
-                peerConnection.onicecandidate = (event) => {
-                    if (event.candidate) {
-                        debugLog('ICE candidate:', event.candidate);
-                        
-                        // Send candidate to server
-                        // In a production app, you would send this to your signaling server
-                        // For this demo, OpenAI handles the signaling
-                    }
-                };
-                
-                // Handle ICE connection state change
-                peerConnection.oniceconnectionstatechange = () => {
-                    debugLog('ICE connection state:', peerConnection.iceConnectionState);
-                    
-                    if (peerConnection.iceConnectionState === 'connected') {
-                        updateStatus('Connected. Ready to start conversation.');
-                    } else if (peerConnection.iceConnectionState === 'disconnected' || 
-                              peerConnection.iceConnectionState === 'failed') {
-                        updateStatus('Connection lost. Attempting to reconnect...');
-                    }
-                };
-                
-                // Handle negotiation needed events
-                peerConnection.onnegotiationneeded = async () => {
-                    try {
-                        debugLog('Negotiation needed');
-                        
-                        // Create and set local description
-                        const offer = await peerConnection.createOffer();
-                        await peerConnection.setLocalDescription(offer);
-                        
-                        // Send offer to server
-                        // In a production app, you would send this to your signaling server
-                    } catch (error) {
-                        console.error('Error during negotiation:', error);
-                    }
-                };
-                
-                // Handle track events
-                peerConnection.ontrack = (event) => {
-                    debugLog('Track received:', event.track.kind);
-                    
-                    if (event.track.kind === 'audio') {
-                        // Store audio receiver
-                        audioReceiver = event.receiver;
-                        
-                        // Set up audio playback
-                        setupAudioPlayback(event.streams[0]);
-                    }
-                };
-                
-                // Set remote description
-                await peerConnection.setRemoteDescription(sessionData.remote_description);
-                
-                // Create answer
-                const answer = await peerConnection.createAnswer();
-                await peerConnection.setLocalDescription(answer);
-                
-                debugLog('WebRTC connection setup complete');
-            } catch (error) {
-                console.error('Error setting up WebRTC:', error);
-                throw error;
-            }
-        }
-        
-        // Update session configuration
-        async function updateSessionConfiguration() {
-            try {
-                debugLog('Updating session configuration...');
-                
-                if (!sessionId) {
-                    throw new Error('No active session');
-                }
-                
-                // Send update request
-                const response = await fetch('/api/update-session', {
-                    method: 'POST',
-                    headers: {
-                        'Content-Type': 'application/json'
-                    },
-                    body: JSON.stringify({
-                        sessionId: sessionId,
-                        language: currentLanguage
-                    })
-                });
-                
-                if (!response.ok) {
-                    const error = await response.json();
-                    throw new Error(`Failed to update session: ${error.error || 'Unknown error'}`);
-                }
-                
-                const updateData = await response.json();
-                debugLog('Session updated:', updateData);
-                
-                return updateData;
-            } catch (error) {
-                console.error('Error updating session:', error);
-                throw error;
-            }
-        }
-        
-        // Handle data channel messages
-        function handleDataChannelMessage(data) {
-            try {
-                const message = JSON.parse(data);
-                debugLog('Data channel message:', message);
-                
-                // Handle different message types
-                switch (message.type) {
-                    case 'conversation.item.text.created':
-                        handleTextMessage(message);
-                        break;
-                        
-                    case 'conversation.item.audio.created':
-                        // Audio is handled via the audio track
-                        break;
-                        
-                    case 'conversation.item.audio.done':
-                        // Audio playback complete
-                        isSpeaking = false;
-                        break;
-                        
-                    case 'error':
-                        handleErrorMessage(message);
-                        break;
-                        
-                    default:
-                        if (message.content && message.content.tool_calls && message.content.tool_calls.length > 0) {
-                            handleFunctionCall(message);
-                        }
-                }
-            } catch (error) {
-                console.error('Error handling data channel message:', error);
-            }
-        }
-        
-        // Handle text messages
-        function handleTextMessage(message) {
-            if (!message.content || !message.content.content) return;
-            
-            const role = message.content.role === 'assistant' ? 'agent' : message.content.role;
-            const text = message.content.content;
-            
-            // Add to transcript
-            addMessageToTranscript({
-                speaker: role,
-                text: text
+// Initialize
+function initialize() {
+    console.log('Initializing...');
+    
+    // Connect to server WebSocket
+    connectToServer();
+    
+    // Set up UI event listeners
+    document.getElementById('startButton').addEventListener('click', toggleRecording);
+    document.getElementById('sendButton').addEventListener('click', sendTextMessage);
+    document.getElementById('languageSelect').addEventListener('change', changeLanguage);
+}
+
+// Connect to server
+function connectToServer() {
+    const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
+    const wsUrl = `${protocol}//${window.location.host}/ws`;
+    
+    websocket = new WebSocket(wsUrl);
+    
+    websocket.onopen = () => {
+        console.log('Connected to server');
+        updateStatus('Connected to server...');
+    };
+    
+    // Modify the client-side WebSocket message handler
+websocket.onmessage = (event) => {
+    try {
+        // Check if the data is a Blob (binary data)
+        if (event.data instanceof Blob) {
+            // Handle binary data (likely audio)
+            event.data.arrayBuffer().then(buffer => {
+                // Process audio data
+                playAudioFromArrayBuffer(buffer);
             });
+            return;
         }
         
-        // Handle function calls
-        function handleFunctionCall(message) {
-            try {
-                const toolCall = message.content.tool_calls[0];
-                const functionName = toolCall.name;
-                const functionArgs = JSON.parse(toolCall.arguments);
-                const functionId = message.item_id;
-                
-                debugLog('Function call:', { name: functionName, args: functionArgs, id: functionId });
-                
-                let result = null;
-                
-                // Process function call
-                switch (functionName) {
-                    case 'add_to_cart':
-                        result = handleAddToCartAction({
-                            ...functionArgs,
-                            type: functionName,
-                            function_name: functionName,
-                            function_call_id: functionId
-                        });
-                        break;
-                        
-                    case 'modify_cart_item':
-                        result = handleModifyCartItemAction({
-                            ...functionArgs,
-                            type: functionName,
-                            function_name: functionName,
-                            function_call_id: functionId
-                        });
-                        break;
-                        
-                    case 'remove_from_cart':
-                        result = handleRemoveFromCartAction({
-                            ...functionArgs,
-                            type: functionName,
-                            function_name: functionName,
-                            function_call_id: functionId
-                        });
-                        break;
-                        
-                    case 'clear_cart':
-                        result = handleClearCartAction();
-                        break;
-                        
-                    case 'checkout':
-                        result = handleCheckoutAction({
-                            ...functionArgs,
-                            type: functionName,
-                            function_name: functionName,
-                            function_call_id: functionId
-                        });
-                        break;
-                        
-                    default:
-                        debugLog('Unknown function name:', functionName);
-                }
-                
-                // Send function response
-                if (result) {
-                    sendFunctionResponse(functionId, functionName, result);
-                }
-            } catch (error) {
-                console.error('Error handling function call:', error);
-            }
+        // Parse as JSON if it's text data
+        const message = JSON.parse(event.data);
+        handleServerMessage(message);
+    } catch (error) {
+        console.error('Error handling WebSocket message:', error);
+        console.log('Raw message data:', event.data);
+    }
+};
+
+// Function to play audio from ArrayBuffer
+function playAudioFromArrayBuffer(arrayBuffer) {
+    try {
+        // Create audio context if needed
+        if (!audioContext) {
+            audioContext = new (window.AudioContext || window.webkitAudioContext)();
         }
         
-        // Handle error messages
-        function handleErrorMessage(message) {
-            console.error('OpenAI Error:', message.error);
-            updateStatus(`Error: ${message.error.message || 'Unknown error'}`);
+        // Decode the audio data
+        audioContext.decodeAudioData(arrayBuffer, (buffer) => {
+            // Create source node
+            const source = audioContext.createBufferSource();
+            source.buffer = buffer;
             
-            // Add error message to transcript
-            addMessageToTranscript({
-                speaker: 'agent',
-                text: `I'm sorry, there was an error processing your request. Please try again.`
-            });
-        }
+            // Connect to output
+            source.connect(audioContext.destination);
+            
+            // Start playback
+            source.start(0);
+        }, (error) => {
+            console.error('Error decoding audio:', error);
+        });
+    } catch (error) {
+        console.error('Error playing audio:', error);
+    }
+}
+    
+    websocket.onerror = (error) => {
+        console.error('WebSocket error:', error);
+        updateStatus('Connection error');
+    };
+    
+    websocket.onclose = () => {
+        console.log('Disconnected from server');
+        updateStatus('Disconnected. Refresh to reconnect.');
         
-        // Send function response
-        async function sendFunctionResponse(functionId, functionName, result) {
+        // Stop recording if active
+        if (isRecording) {
+            stopRecording();
+        }
+    };
+}
+
+// Handle messages from server
+function handleServerMessage(message) {
+    console.log('Message from server:', message);
+    
+    switch (message.type) {
+        case 'connection':
+            // Store client ID
+            clientId = message.id;
+            console.log('Connected with ID:', clientId);
+            
+            // Initialize session with language
+            initializeSession();
+            break;
+            
+        case 'ready':
+            // OpenAI connection ready
+            updateStatus('Ready. Click "Start Conversation" to begin.');
+            document.getElementById('startButton').disabled = false;
+            break;
+            
+        case 'text':
+            // Handle text message
+            addMessageToTranscript('agent', message.data);
+            break;
+            
+        case 'audio':
+            // Handle audio message with improved error handling
+            console.log('Audio message received:', message);
             try {
-                if (!sessionId) {
-                    throw new Error('No active session');
+                if (message.data) {
+                    const audioData = message.data;
+                    playAudioFromBase64(audioData, message.format || 'mp3');
                 }
-                
-                debugLog('Sending function response:', { id: functionId, name: functionName, result });
-                
-                // Send function response to server
-                const response = await fetch('/api/function-response', {
-                    method: 'POST',
-                    headers: {
-                        'Content-Type': 'application/json'
-                    },
-                    body: JSON.stringify({
-                        sessionId,
-                        functionCallId: functionId,
-                        functionName,
-                        result
-                    })
-                });
-                
-                if (!response.ok) {
-                    const error = await response.json();
-                    throw new Error(`Failed to send function response: ${error.error || 'Unknown error'}`);
-                }
-                
-                const responseData = await response.json();
-                debugLog('Function response sent:', responseData);
-                
-                return responseData;
             } catch (error) {
-                console.error('Error sending function response:', error);
+                console.error('Error handling audio message:', error);
             }
-        }
-        
-        // Send text message
-        async function sendTextMessage(text) {
+            break;
+            
+        case 'error':
+            // Handle error message
+            console.error('Error from OpenAI:', message);
+            updateStatus(`Error: ${message.error ? message.error.message : 'Unknown error'}`);
+            break;
+
+        case 'binary_data':
+            console.log('Received binary data');
+            
+            // Try to decode base64 data to see if it's actually a text/JSON message
             try {
-                if (!sessionId) {
-                    throw new Error('No active session');
-                }
+                const decodedText = atob(message.data);
+                console.log('Decoded binary data:', decodedText.substring(0, 100));
                 
-                debugLog('Sending text message:', text);
-                
-                // Add to transcript
-                addMessageToTranscript({
-                    speaker: 'user',
-                    text
-                });
-                
-                // Send text message to server
-                const response = await fetch('/api/send-text', {
-                    method: 'POST',
-                    headers: {
-                        'Content-Type': 'application/json'
-                    },
-                    body: JSON.stringify({
-                        sessionId,
-                        text
-                    })
-                });
-                
-                if (!response.ok) {
-                    const error = await response.json();
-                    throw new Error(`Failed to send text message: ${error.error || 'Unknown error'}`);
-                }
-                
-                const responseData = await response.json();
-                debugLog('Text message sent:', responseData);
-                
-                return responseData;
-            } catch (error) {
-                console.error('Error sending text message:', error);
-                updateStatus(`Error: ${error.message}`);
-            }
-        }
-        
-        // Setup audio playback
-        function setupAudioPlayback(stream) {
-            try {
-                debugLog('Setting up audio playback...');
-                
-                // Create audio context for playback
-                if (!audioReceiveContext) {
-                    audioReceiveContext = new (window.AudioContext || window.webkitAudioContext)();
-                } else if (audioReceiveContext.state === 'suspended') {
-                    audioReceiveContext.resume();
-                }
-                
-                // Create audio element
-                const audioElement = new Audio();
-                audioElement.srcObject = stream;
-                audioElement.play();
-                
-                audioElement.onplaying = () => {
-                    debugLog('Audio playback started');
-                    isSpeaking = true;
-                };
-                
-                audioElement.onended = () => {
-                    debugLog('Audio playback ended');
-                    isSpeaking = false;
-                };
-                
-                debugLog('Audio playback setup complete');
-            } catch (error) {
-                console.error('Error setting up audio playback:', error);
-            }
-        }
-        
-        // Start recording
-        async function startRecording() {
-            try {
-                debugLog('Starting recording...');
-                
-                // Check if session is active
-                if (!sessionId || !peerConnection) {
-                    throw new Error('No active session');
-                }
-                
-                // Request microphone access
-                microphoneStream = await navigator.mediaDevices.getUserMedia({
-                    audio: {
-                        channelCount: 1,
-                        sampleRate: 16000,
-                        echoCancellation: true,
-                        noiseSuppression: true,
-                        autoGainControl: true
+                // Try to parse as JSON
+                try {
+                    const jsonData = JSON.parse(decodedText);
+                    console.log('Binary data decoded as JSON:', jsonData);
+                    
+                    // Handle as normal JSON message
+                    if (jsonData.type === 'error') {
+                        console.error('Error from OpenAI:', jsonData);
+                        updateStatus(`Error: ${jsonData.error ? jsonData.error.message : 'Unknown error'}`);
+                    } else if (jsonData.type === 'text' && jsonData.text) {
+                        addMessageToTranscript('agent', jsonData.text);
+                    } else {
+                        console.log('Unhandled JSON message type:', jsonData.type);
                     }
-                });
-                
-                // Create audio context
-                if (!audioContext) {
-                    audioContext = new (window.AudioContext || window.webkitAudioContext)({
-                        sampleRate: 16000
-                    });
-                } else if (audioContext.state === 'suspended') {
-                    await audioContext.resume();
-                }
-                
-                // Add audio track to peer connection
-                const audioTrack = microphoneStream.getAudioTracks()[0];
-                
-                if (!audioTrack) {
-                    throw new Error('No audio track available');
-                }
-                
-                // Add track to peer connection
-                audioSender = peerConnection.addTrack(audioTrack, microphoneStream);
-                
-                // Update UI
-                isConversationActive = true;
-                startButton.textContent = "Stop Listening";
-                startButton.classList.add('recording');
-                microphoneIndicator.classList.add('active');
-                updateStatus("Listening... (click to stop)");
-                
-                debugLog('Recording started');
-            } catch (error) {
-                console.error('Error starting recording:', error);
-                updateStatus(`Microphone error: ${error.message}`);
-                stopRecording();
-            }
-        }
-        
-        // Stop recording
-        function stopRecording() {
-            debugLog('Stopping recording...');
-            
-            try {
-                // Remove audio sender
-                if (audioSender && peerConnection) {
-                    peerConnection.removeTrack(audioSender);
-                    audioSender = null;
-                }
-                
-                // Stop microphone stream
-                if (microphoneStream) {
-                    microphoneStream.getTracks().forEach(track => track.stop());
-                    microphoneStream = null;
-                }
-                
-                // Update UI
-                isConversationActive = false;
-                startButton.textContent = "Start Conversation";
-                startButton.classList.remove('recording');
-                microphoneIndicator.classList.remove('active');
-                updateStatus("Paused. Click 'Start Conversation' to continue.");
-                
-                debugLog('Recording stopped');
-            } catch (error) {
-                console.error('Error stopping recording:', error);
-            }
-        }
-        
-        // Button event listeners
-        startButton.addEventListener('click', function() {
-            if (!isConversationActive) {
-                startRecording();
-            } else {
-                stopRecording();
-            }
-        });
-        
-        sendButton.addEventListener('click', function() {
-            sendTextInput();
-        });
-        
-        textInput.addEventListener('keyup', function(event) {
-            if (event.key === 'Enter') {
-                sendTextInput();
-            }
-        });
-        
-        checkoutButton.addEventListener('click', function() {
-            if (cart.length === 0) {
-                alert('Your cart is empty. Add some items before checkout.');
-                return;
-            }
-            
-            showCheckoutForm(true, '', '');
-        });
-        
-        languageSelect.addEventListener('change', function() {
-            // Update current language
-            currentLanguage = languageSelect.value;
-            debugLog('Language changed to:', currentLanguage);
-            
-            // Update session configuration
-            updateSessionConfiguration()
-                .then(() => {
-                    updateStatus(`Language set to: ${currentLanguage === 'ur' ? 'Urdu' : 'English'}`);
-                })
-                .catch(error => {
-                    console.error('Error updating language:', error);
-                    updateStatus(`Error updating language: ${error.message}`);
                     
-                    // Revert to previous language
-                    currentLanguage = currentLanguage === 'en' ? 'ur' : 'en';
-                    languageSelect.value = currentLanguage;
-                });
-        });
-        
-        // Send text input
-        function sendTextInput() {
-            const text = textInput.value.trim();
-            if (!text) return;
-            
-            sendTextMessage(text)
-                .then(() => {
-                    // Clear input
-                    textInput.value = '';
-                })
-                .catch(error => {
-                    console.error('Error sending text:', error);
-                });
-        }
-        
-        // Update status
-        function updateStatus(message) {
-            statusElement.textContent = message;
-        }
-        
-        // Add message to transcript
-        function addMessageToTranscript(message) {
-            const messageElement = document.createElement('div');
-            messageElement.classList.add('transcript-message');
-            messageElement.classList.add(message.speaker + '-message');
-            messageElement.textContent = message.text;
-            transcript.appendChild(messageElement);
-            
-            // Scroll to bottom
-            transcript.scrollTop = transcript.scrollHeight;
-        }
-        
-        // Cart management functions
-        function addToCart(item) {
-            debugLog(`Adding to cart: ${item.name}`, item);
-            
-            // Add item to cart
-            cart.push(item);
-            totalPrice += item.totalPrice;
-            
-            // Update UI
-            updateCartUI();
-        }
-        
-        function removeFromCart(itemId) {
-            debugLog(`Removing from cart: ${itemId}`);
-            
-            const index = cart.findIndex(item => item.id === itemId);
-            
-            if (index !== -1) {
-                // Subtract price from total
-                totalPrice -= cart[index].totalPrice;
-                
-                // Remove item
-                cart.splice(index, 1);
-                
-                // Update UI
-                updateCartUI();
-            }
-        }
-        
-        function updateCartUI() {
-            // Clear cart items
-            cartItemsElement.innerHTML = '';
-            
-            // Add each item
-            cart.forEach(item => {
-                const cartItemElement = document.createElement('div');
-                cartItemElement.classList.add('cart-item');
-                
-                const quantityText = item.quantity > 1 ? `${item.quantity}x ` : '';
-                
-                cartItemElement.innerHTML = `
-                    <div class="cart-item-details">
-                        <div class="cart-item-title">${quantityText}${item.name}</div>
-                        ${item.size ? `<div class="cart-item-customization">${item.size}</div>` : ''}
-                        ${item.customizations && item.customizations.length > 0 ? 
-                            `<div class="cart-item-customization">${item.customizations.join(', ')}</div>` : ''}
-                    </div>
-                    <div class="cart-item-price">$${item.totalPrice.toFixed(2)}</div>
-                `;
-                
-                cartItemsElement.appendChild(cartItemElement);
-            });
-            
-            // Update total
-            cartTotalElement.innerHTML = `
-                <span>Total:</span>
-                <span>$${totalPrice.toFixed(2)}</span>
-            `;
-            
-            // Update item count
-            const totalItems = cart.reduce((total, item) => total + (item.quantity || 1), 0);
-            itemCountElement.textContent = `${totalItems} item${totalItems !== 1 ? 's' : ''}`;
-            
-            // Enable/disable checkout button
-            checkoutButton.disabled = totalItems === 0;
-            
-            debugLog(`Cart updated: ${totalItems} items, total: $${totalPrice.toFixed(2)}`);
-        }
-        
-        // Handle add to cart action
-        function handleAddToCartAction(action) {
-            debugLog('Adding to cart:', action);
-            
-            // Find the menu item in our data
-            const item = findMenuItem(action.item, window.restaurantData);
-            
-            if (!item) {
-                console.error('Item not found:', action.item);
-                return { success: false, error: `Item "${action.item}" not found` };
-            }
-            
-            // Create the cart item
-            const cartItem = {
-                id: action.id || item.id || `item_${Date.now()}`,
-                name: item.name,
-                price: item.price,
-                description: item.description,
-                quantity: action.quantity || 1,
-                size: action.size || null,
-                customizations: action.customizations || []
-            };
-            
-            // Calculate the total price
-            cartItem.totalPrice = calculateItemPrice(cartItem);
-            
-            // Add to cart
-            addToCart(cartItem);
-            
-            // Show visual confirmation
-            showOrderConfirmation(cartItem);
-            
-            // Return success result
-            return { 
-                success: true, 
-                item: {
-                    id: cartItem.id,
-                    name: cartItem.name,
-                    price: cartItem.price,
-                    quantity: cartItem.quantity,
-                    size: cartItem.size,
-                    customizations: cartItem.customizations,
-                    totalPrice: cartItem.totalPrice
-                }
-            };
-        }
-        
-        // Handle modify cart item action
-        function handleModifyCartItemAction(action) {
-            debugLog('Modifying cart item:', action);
-            
-            if (!action.item) {
-                console.error('No item specified for modification');
-                return { success: false, error: 'No item specified for modification' };
-            }
-            
-            // Find the item in the cart by name
-            const itemIndex = cart.findIndex(item => 
-                item.name && item.name.toLowerCase() === action.item.toLowerCase());
-            
-            if (itemIndex === -1) {
-                console.error('Item not found in cart:', action.item);
-                return { success: false, error: `Item "${action.item}" not found in cart` };
-            }
-            
-            const cartItem = cart[itemIndex];
-            const oldTotalPrice = cartItem.totalPrice;
-            
-            // Apply changes
-            if (action.quantity !== undefined) {
-                cartItem.quantity = action.quantity;
-            }
-            
-            if (action.size !== undefined) {
-                cartItem.size = action.size;
-            }
-            
-            if (action.customizations !== undefined) {
-                cartItem.customizations = action.customizations;
-            }
-            
-            // Recalculate price
-            cartItem.totalPrice = calculateItemPrice(cartItem);
-            
-            // Update total price
-            totalPrice = totalPrice - oldTotalPrice + cartItem.totalPrice;
-            
-            // Update cart UI
-            updateCartUI();
-            
-            // Show confirmation
-            showModificationConfirmation(cartItem);
-            
-            // Return success result
-            return { 
-                success: true, 
-                item: {
-                    id: cartItem.id,
-                    name: cartItem.name,
-                    totalPrice: cartItem.totalPrice
-                }
-            };
-        }
-        
-        // Handle remove from cart action
-        function handleRemoveFromCartAction(action) {
-            debugLog('Removing from cart:', action);
-            
-            if (!action.item) {
-                console.error('No item specified for removal');
-                return { success: false, error: 'No item specified for removal' };
-            }
-            
-            // Find the item in the cart by name
-            const itemIndex = cart.findIndex(item => 
-                item.name && item.name.toLowerCase() === action.item.toLowerCase());
-            
-            if (itemIndex === -1) {
-                console.error('Item not found in cart:', action.item);
-                return { success: false, error: `Item "${action.item}" not found in cart` };
-            }
-            
-            const cartItem = cart[itemIndex];
-            
-            // Remove from cart
-            removeFromCart(cartItem.id);
-            
-            // Show confirmation
-            showRemovalConfirmation(cartItem);
-            
-            // Return success result
-            return { 
-                success: true, 
-                item: {
-                    name: cartItem.name,
-                    id: cartItem.id
-                }
-            };
-        }
-        
-        // Handle clear cart action
-        function handleClearCartAction() {
-            debugLog('Clearing cart');
-            
-            // Get cart size before clearing
-            const itemCount = cart.length;
-            
-            // Clear the cart
-            cart = [];
-            totalPrice = 0;
-            updateCartUI();
-            
-            // Show confirmation
-            showClearCartConfirmation();
-            
-            // Return success result
-            return { 
-                success: true, 
-                itemsRemoved: itemCount
-            };
-        }
-        
-        // Handle checkout action
-        function handleCheckoutAction(action) {
-            debugLog('Starting checkout:', action);
-            
-            // Show checkout form with provided info
-            const delivery = action.delivery !== undefined ? action.delivery : true;
-            const address = action.address || '';
-            const phone = action.phone || '';
-            
-            showCheckoutForm(delivery, address, phone);
-            
-            // Return success result
-            return { success: true };
-        }
-        
-        // Find menu item by name
-        function findMenuItem(name, data) {
-            if (!name) return null;
-            if (!data || !data.menu) return null;
-            
-            const searchName = name.toLowerCase();
-            
-            // Search in each menu category
-            for (const category of ['pizzas', 'sides', 'drinks', 'desserts']) {
-                const items = data.menu[category];
-                if (!items) continue;
-                
-                const found = items.find(item => item.name.toLowerCase() === searchName);
-                if (found) return found;
-            }
-            
-            // Check for alternative names
-            if (data.menuKeywords) {
-                for (const [keyword, variants] of Object.entries(data.menuKeywords)) {
-                    if (keyword.toLowerCase() === searchName) {
-                        const id = variants[0];
-                        
-                        // Search for item by ID
-                        for (const category of ['pizzas', 'sides', 'drinks', 'desserts']) {
-                            const items = data.menu[category];
-                            if (!items) continue;
-                            
-                            const found = items.find(item => item.id === id);
-                            if (found) return found;
-                        }
-                    }
-                }
-            }
-            
-            return null;
-        }
-        
-        // Calculate item price
-        function calculateItemPrice(item) {
-            if (!item) return 0;
-            
-            let basePrice = item.price || 0;
-            
-            // Adjust for size if applicable
-            if (item.size && window.restaurantData && window.restaurantData.customizations && 
-                window.restaurantData.customizations.sizes) {
-                
-                const sizeData = window.restaurantData.customizations.sizes.find(
-                    s => s.name.toLowerCase() === item.size.toLowerCase());
-                
-                if (sizeData && sizeData.adjustmentFactor) {
-                    basePrice *= sizeData.adjustmentFactor;
-                }
-            }
-            
-            // Add cost for customizations
-            let additionalCost = 0;
-            
-            if (item.customizations && item.customizations.length > 0 && 
-                window.restaurantData && window.restaurantData.customizations &&
-                window.restaurantData.customizations.toppings) {
-                
-                for (const customization of item.customizations) {
-                    if (!customization) continue;
-                    
-                    // Handle cases where customization might be an object or a string
-                    const customizationName = typeof customization === 'string' ? 
-                        customization : (customization.name || '');
-                    
-                    const toppingData = window.restaurantData.customizations.toppings.find(
-                        t => t.name && t.name.toLowerCase() === customizationName.toLowerCase());
-                    
-                    if (toppingData && toppingData.price) {
-                        additionalCost += toppingData.price;
-                    }
-                }
-            }
-            
-            // Calculate total based on quantity
-            return parseFloat(((basePrice + additionalCost) * (item.quantity || 1)).toFixed(2));
-        }
-        
-        // Show notification functions
-        function showOrderConfirmation(item) {
-            const notification = document.createElement('div');
-            notification.classList.add('order-notification', 'added');
-            
-            // Format the item details
-            const sizeTxt = item.size ? `${item.size} ` : '';
-            const customizationsTxt = item.customizations && item.customizations.length > 0 
-                ? ` with ${item.customizations.join(', ')}` 
-                : '';
-            
-            notification.innerHTML = `
-                <div class="notification-icon">✓</div>
-                <div class="notification-text">
-                    Added ${item.quantity}x ${sizeTxt}${item.name}${customizationsTxt}
-                </div>
-            `;
-            
-            showNotification(notification);
-            highlightCartSection();
-        }
-        
-        function showModificationConfirmation(item) {
-            const notification = document.createElement('div');
-            notification.classList.add('order-notification', 'modified');
-            
-            notification.innerHTML = `
-                <div class="notification-icon">✓</div>
-                <div class="notification-text">
-                    Updated ${item.name} in your cart
-                </div>
-            `;
-            
-            showNotification(notification);
-            highlightCartSection();
-        }
-        
-        function showRemovalConfirmation(item) {
-            const notification = document.createElement('div');
-            notification.classList.add('order-notification', 'removed');
-            
-            notification.innerHTML = `
-                <div class="notification-icon">✓</div>
-                <div class="notification-text">
-                    Removed ${item.name} from your cart
-                </div>
-            `;
-            
-            showNotification(notification);
-            highlightCartSection();
-        }
-        
-        function showClearCartConfirmation() {
-            const notification = document.createElement('div');
-            notification.classList.add('order-notification', 'cleared');
-            
-            notification.innerHTML = `
-                <div class="notification-icon">✓</div>
-                <div class="notification-text">
-                    Your cart has been cleared
-                </div>
-            `;
-            
-            showNotification(notification);
-            highlightCartSection();
-        }
-        
-        function showNotification(notification) {
-            // Add to the page
-            document.body.appendChild(notification);
-            
-            // Animate in, then remove after a delay
-            setTimeout(() => {
-                notification.classList.add('show');
-                
-                setTimeout(() => {
-                    notification.classList.remove('show');
-                    setTimeout(() => {
-                        document.body.removeChild(notification);
-                    }, 300);
-                }, 2000);
-            }, 10);
-        }
-        
-        function highlightCartSection() {
-            const cartContainer = document.querySelector('.cart-container');
-            if (cartContainer) {
-                cartContainer.classList.add('highlight');
-                
-                setTimeout(() => {
-                    cartContainer.classList.remove('highlight');
-                }, 1500);
-            }
-        }
-        
-        // Show checkout form
-        function showCheckoutForm(delivery, address, phone) {
-            // Create a modal for checkout
-            const modal = document.createElement('div');
-            modal.classList.add('checkout-modal');
-            
-            const modalContent = document.createElement('div');
-            modalContent.classList.add('modal-content');
-            
-            // Build order summary
-            let orderSummary = '<h2>Order Summary</h2>';
-            orderSummary += '<div class="order-items">';
-            
-            cart.forEach(item => {
-                const sizeTxt = item.size ? `${item.size} ` : '';
-                const customizationsTxt = item.customizations && item.customizations.length > 0 
-                    ? ` with ${item.customizations.join(', ')}` 
-                    : '';
-                    
-                orderSummary += `
-                    <div class="order-item">
-                        <div class="order-item-details">
-                            <span class="order-item-quantity">${item.quantity}x</span>
-                            <span class="order-item-name">${sizeTxt}${item.name}${customizationsTxt}</span>
-                        </div>
-                        <div class="order-item-price">${item.totalPrice.toFixed(2)}</div>
-                    </div>
-                `;
-            });
-            
-            orderSummary += '</div>';
-            
-            // Add delivery info if applicable
-            if (delivery && window.restaurantData.delivery) {
-                orderSummary += `
-                    <div class="delivery-info">
-                        <div class="delivery-row">
-                            <span>Subtotal:</span>
-                            <span>${totalPrice.toFixed(2)}</span>
-                        </div>
-                        <div class="delivery-row">
-                            <span>Delivery Fee:</span>
-                            <span>${window.restaurantData.delivery.fee.toFixed(2)}</span>
-                        </div>
-                        <div class="delivery-row total">
-                            <span>Total:</span>
-                            <span>${(totalPrice + window.restaurantData.delivery.fee).toFixed(2)}</span>
-                        </div>
-                        <div class="delivery-note">
-                            Estimated delivery time: ${window.restaurantData.delivery.estimatedTime}
-                        </div>
-                    </div>
-                `;
-            } else {
-                orderSummary += `
-                    <div class="order-total">
-                        <span>Total:</span>
-                        <span>${totalPrice.toFixed(2)}</span>
-                    </div>
-                `;
-            }
-            
-            // Add checkout form
-            const checkoutForm = `
-                <div class="checkout-form">
-                    <h3>${delivery ? 'Delivery' : 'Pickup'} Information</h3>
-                    <div class="form-group">
-                        <label for="name">Name</label>
-                        <input type="text" id="name" placeholder="Your Name">
-                    </div>
-                    <div class="form-group">
-                        <label for="phone">Phone</label>
-                        <input type="tel" id="phone" placeholder="Phone Number" value="${phone}">
-                    </div>
-                    ${delivery ? `
-                    <div class="form-group">
-                        <label for="address">Address</label>
-                        <input type="text" id="address" placeholder="Delivery Address" value="${address}">
-                    </div>` : ''}
-                    <div class="form-buttons">
-                        <button id="cancelCheckout" class="cancel-btn">Cancel</button>
-                        <button id="confirmOrder" class="confirm-btn">Confirm Order</button>
-                    </div>
-                </div>
-            `;
-            
-            modalContent.innerHTML = orderSummary + checkoutForm;
-            modal.appendChild(modalContent);
-            
-            // Add to page
-            document.body.appendChild(modal);
-            
-            // Set up event listeners
-            document.getElementById('cancelCheckout').addEventListener('click', () => {
-                document.body.removeChild(modal);
-            });
-            
-            document.getElementById('confirmOrder').addEventListener('click', () => {
-                // Get form values
-                const name = document.getElementById('name').value;
-                const phone = document.getElementById('phone').value;
-                const address = delivery ? document.getElementById('address').value : 'Pickup';
-                
-                // Basic validation
-                if (!name || !phone || (delivery && !address)) {
-                    alert('Please fill out all fields');
                     return;
+                } catch (jsonError) {
+                    // Not valid JSON, might be actual binary data
+                    console.log('Not valid JSON, proceeding with binary data handling');
                 }
+            } catch (decodeError) {
+                console.error('Error decoding base64:', decodeError);
+            }
+            
+            // If it gets here, treat as audio
+            if (message.format && message.format.startsWith('audio/')) {
+                try {
+                    playAudio(message.data, message.format);
+                } catch (error) {
+                    console.error('Error playing audio:', error);
+                }
+            } else {
+                console.log('Received unhandled binary data type:', message.format);
+            }
+            break;
+
+        case 'function_call':
+            // Handle function call
+            handleFunctionCall(message);
+            break;
+            
+        case 'error':
+            // Handle error
+            console.error('Server error:', message.error);
+            updateStatus(`Error: ${message.error.message}`);
+            break;
+            
+        case 'disconnected':
+            // Handle disconnection
+            updateStatus('Connection to AI lost. Try refreshing.');
+            document.getElementById('startButton').disabled = true;
+            break;
+    }
+}
+
+let audioBuffer = [];
+let lastCommitTime = 0;
+const MIN_BUFFER_SIZE = 4096; // Minimum buffer size before sending
+const MIN_BUFFER_TIME = 500; // Minimum time between commits in ms
+
+// Send audio data to OpenAI
+function sendAudioToOpenAI(clientState, audioData) {
+    if (!clientState.openaiWs || clientState.openaiWs.readyState !== WebSocket.OPEN) {
+        console.warn(`Cannot send audio: No OpenAI connection for client ${clientState.id}`);
+        return;
+    }
+    
+    // Use the format for audio data with the correct parameter name
+    const message = {
+        type: "input_audio_buffer.append",
+        audio: audioData  // Changed from audio_data to audio
+    };
+    
+    console.log('Sending audio data to OpenAI');
+    clientState.openaiWs.send(JSON.stringify(message));
+    
+    // Then commit the buffer
+    const commitMessage = {
+        type: "input_audio_buffer.commit"
+    };
+    
+    console.log('Committing audio buffer');
+    clientState.openaiWs.send(JSON.stringify(commitMessage));
+}
+
+function playAudioFromBase64(base64Data, format) {
+    try {
+        // Create an audio element (more reliable than Web Audio API for some formats)
+        const audio = new Audio();
+        
+        // Set the source as a data URL
+        audio.src = `data:audio/${format};base64,${base64Data}`;
+        
+        // Play with error handling
+        const playPromise = audio.play();
+        
+        if (playPromise !== undefined) {
+            playPromise.catch(error => {
+                console.error('Error playing audio:', error);
                 
-                // Clear cart
-                cart = [];
-                totalPrice = 0;
-                updateCartUI();
-                
-                // Replace modal content with confirmation
-                modalContent.innerHTML = `
-                    <div class="order-confirmation">
-                        <div class="confirmation-icon">✓</div>
-                        <h2>Order Confirmed!</h2>
-                        <p>Thank you for your order, ${name}.</p>
-                        ${delivery ? `<p>We'll deliver to ${address} within ${window.restaurantData.delivery.estimatedTime}.</p>` : 
-                                    `<p>Your order will be ready for pickup in 20-30 minutes.</p>`}
-                        <p>A confirmation has been sent to your phone at ${phone}.</p>
-                        <button id="closeConfirmation" class="confirm-btn">Close</button>
-                    </div>
-                `;
-                
-                // Set up close button
-                document.getElementById('closeConfirmation').addEventListener('click', () => {
-                    document.body.removeChild(modal);
-                });
+                // Fallback to Web Audio API if HTML5 Audio fails
+                fallbackAudioPlayback(base64Data);
             });
         }
+    } catch (error) {
+        console.error('Error setting up audio playback:', error);
+        fallbackAudioPlayback(base64Data);
+    }
+}
+
+// Fallback audio playback using Web Audio API
+function fallbackAudioPlayback(base64Data) {
+    try {
+        // Decode base64
+        const binaryString = atob(base64Data);
+        const bytes = new Uint8Array(binaryString.length);
+        for (let i = 0; i < binaryString.length; i++) {
+            bytes[i] = binaryString.charCodeAt(i);
+        }
         
-        // Initialize
-        initialize();
-    </script>
+        // Create audio context
+        const context = new (window.AudioContext || window.webkitAudioContext)();
+        
+        // Decode with detailed error logging
+        context.decodeAudioData(
+            bytes.buffer,
+            buffer => {
+                // Create source
+                const source = context.createBufferSource();
+                source.buffer = buffer;
+                
+                // Connect to output
+                source.connect(context.destination);
+                
+                // Play
+                source.start(0);
+            },
+            error => {
+                console.error('Detailed audio decoding error:', error);
+                console.error('Audio data length:', base64Data.length);
+                
+                // Show error message to user
+                updateStatus('Audio playback failed. Please check your speakers.');
+            }
+        );
+    } catch (error) {
+        console.error('Error in fallback audio playback:', error);
+    }
+}
+
+// Initialize session
+function initializeSession() {
+    const language = document.getElementById('languageSelect').value;
+    
+    websocket.send(JSON.stringify({
+        type: 'init',
+        language: language
+    }));
+    
+    updateStatus('Connecting to AI...');
+}
+
+// Toggle recording
+function toggleRecording() {
+    if (!isRecording) {
+        startRecording();
+    } else {
+        stopRecording();
+    }
+}
+
+// Start recording
+async function startRecording() {
+    try {
+        // Request microphone access
+        microphoneStream = await navigator.mediaDevices.getUserMedia({
+            audio: {
+                channelCount: 1,
+                sampleRate: 16000,
+                echoCancellation: true,
+                noiseSuppression: true,
+                autoGainControl: true
+            }
+        });
+        
+        // Create audio context
+        audioContext = new (window.AudioContext || window.webkitAudioContext)({
+            sampleRate: 16000
+        });
+        
+        // Create audio source
+        const source = audioContext.createMediaStreamSource(microphoneStream);
+        
+        // Create script processor
+        audioProcessor = audioContext.createScriptProcessor(4096, 1, 1);
+        audioProcessor.onaudioprocess = handleAudioProcess;
+        
+        // Connect nodes
+        source.connect(audioProcessor);
+        audioProcessor.connect(audioContext.destination);
+        
+        // Update UI
+        isRecording = true;
+        document.getElementById('startButton').textContent = 'Stop Listening';
+        document.getElementById('microphoneIndicator').classList.add('active');
+        updateStatus('Listening...');
+    } catch (error) {
+        console.error('Error starting recording:', error);
+        updateStatus(`Microphone error: ${error.message}`);
+    }
+}
+
+const SAMPLE_RATE = 16000;
+const MIN_AUDIO_BUFFER_LENGTH = 4000; // ~250ms at 16kHz
+let audioSampleBuffer = [];
+
+// Handle audio processing
+function handleAudioProcess(event) {
+    if (!isRecording || !websocket || websocket.readyState !== WebSocket.OPEN) {
+        return;
+    }
+    
+    // Get audio data
+    const inputBuffer = event.inputBuffer;
+    const audioData = inputBuffer.getChannelData(0);
+    
+    // Add to our buffer
+    for (let i = 0; i < audioData.length; i++) {
+        audioSampleBuffer.push(audioData[i]);
+    }
+    
+    // Only process when we have enough data
+    if (audioSampleBuffer.length >= MIN_AUDIO_BUFFER_LENGTH) {
+        // Convert to 16-bit PCM
+        const pcmData = new Int16Array(audioSampleBuffer.length);
+        for (let i = 0; i < audioSampleBuffer.length; i++) {
+            pcmData[i] = Math.max(-1, Math.min(1, audioSampleBuffer[i])) * 0x7FFF;
+        }
+        
+        // Clear buffer
+        audioSampleBuffer = [];
+        
+        // Convert to base64
+        const base64Data = arrayBufferToBase64(pcmData.buffer);
+        
+        // Send to server
+        websocket.send(JSON.stringify({
+            type: 'audio',
+            data: base64Data
+        }));
+    }
+}
+
+// Convert ArrayBuffer to Base64
+function arrayBufferToBase64(buffer) {
+    const bytes = new Uint8Array(buffer);
+    let binary = '';
+    for (let i = 0; i < bytes.byteLength; i++) {
+        binary += String.fromCharCode(bytes[i]);
+    }
+    return btoa(binary);
+}
+
+// Stop recording
+function stopRecording() {
+    // Stop microphone
+    if (microphoneStream) {
+        microphoneStream.getTracks().forEach(track => track.stop());
+        microphoneStream = null;
+    }
+    
+    // Disconnect audio processor
+    if (audioProcessor) {
+        audioProcessor.disconnect();
+        audioProcessor = null;
+    }
+    
+    // Update UI
+    isRecording = false;
+    document.getElementById('startButton').textContent = 'Start Conversation';
+    document.getElementById('microphoneIndicator').classList.remove('active');
+    updateStatus('Paused. Click "Start Conversation" to continue.');
+}
+
+// Send text message
+function sendTextMessage() {
+    const text = document.getElementById('textInput').value.trim();
+    if (!text) return;
+    
+    // Add to transcript
+    addMessageToTranscript('user', text);
+    
+    // Send to server
+    websocket.send(JSON.stringify({
+        type: 'text',
+        text: text
+    }));
+    
+    // Clear input
+    document.getElementById('textInput').value = '';
+}
+
+// Change language
+function changeLanguage() {
+    const language = document.getElementById('languageSelect').value;
+    
+    // Re-initialize session with new language
+    initializeSession();
+}
+
+// Handle function calls
+function handleFunctionCall(functionCall) {
+    const functionName = functionCall.name;
+    const functionArgs = functionCall.arguments;
+    const functionId = functionCall.id;
+    
+    console.log(`Function call: ${functionName}`, functionArgs);
+    
+    let result = null;
+    
+    // Process function based on name
+    switch (functionName) {
+        case 'add_to_cart':
+            result = handleAddToCart(functionArgs);
+            break;
+            
+        case 'modify_cart_item':
+            result = handleModifyCartItem(functionArgs);
+            break;
+            
+        case 'remove_from_cart':
+            result = handleRemoveFromCart(functionArgs);
+            break;
+            
+        case 'clear_cart':
+            result = handleClearCart();
+            break;
+            
+        case 'checkout':
+            result = handleCheckout(functionArgs);
+            break;
+            
+        default:
+            console.warn('Unknown function:', functionName);
+            result = { error: 'Unknown function' };
+    }
+    
+    // Send function result back to server
+    websocket.send(JSON.stringify({
+        type: 'function_result',
+        id: functionId,
+        name: functionName,
+        result: result
+    }));
+}
+
+// Function handlers (same as your existing code)
+function handleAddToCartAction(action) {
+    debugLog('Adding to cart:', action);
+    
+    // Find the menu item in our data
+    const item = findMenuItem(action.item, window.restaurantData);
+    
+    if (!item) {
+        console.error('Item not found:', action.item);
+        return { success: false, error: `Item "${action.item}" not found` };
+    }
+    
+    // Create the cart item
+    const cartItem = {
+        id: action.id || item.id || `item_${Date.now()}`,
+        name: item.name,
+        price: item.price,
+        description: item.description,
+        quantity: action.quantity || 1,
+        size: action.size || null,
+        customizations: action.customizations || []
+    };
+    
+    // Calculate the total price
+    cartItem.totalPrice = calculateItemPrice(cartItem);
+    
+    // Add to cart
+    addToCart(cartItem);
+    
+    // Show visual confirmation
+    showOrderConfirmation(cartItem);
+    
+    // Return success result
+    return { 
+        success: true, 
+        item: {
+            id: cartItem.id,
+            name: cartItem.name,
+            price: cartItem.price,
+            quantity: cartItem.quantity,
+            size: cartItem.size,
+            customizations: cartItem.customizations,
+            totalPrice: cartItem.totalPrice
+        }
+    };
+}
+
+// Handle modify cart item action
+function handleModifyCartItemAction(action) {
+    debugLog('Modifying cart item:', action);
+    
+    if (!action.item) {
+        console.error('No item specified for modification');
+        return { success: false, error: 'No item specified for modification' };
+    }
+    
+    // Find the item in the cart by name
+    const itemIndex = cart.findIndex(item => 
+        item.name && item.name.toLowerCase() === action.item.toLowerCase());
+    
+    if (itemIndex === -1) {
+        console.error('Item not found in cart:', action.item);
+        return { success: false, error: `Item "${action.item}" not found in cart` };
+    }
+    
+    const cartItem = cart[itemIndex];
+    const oldTotalPrice = cartItem.totalPrice;
+    
+    // Apply changes
+    if (action.quantity !== undefined) {
+        cartItem.quantity = action.quantity;
+    }
+    
+    if (action.size !== undefined) {
+        cartItem.size = action.size;
+    }
+    
+    if (action.customizations !== undefined) {
+        cartItem.customizations = action.customizations;
+    }
+    
+    // Recalculate price
+    cartItem.totalPrice = calculateItemPrice(cartItem);
+    
+    // Update total price
+    totalPrice = totalPrice - oldTotalPrice + cartItem.totalPrice;
+    
+    // Update cart UI
+    updateCartUI();
+    
+    // Show confirmation
+    showModificationConfirmation(cartItem);
+    
+    // Return success result
+    return { 
+        success: true, 
+        item: {
+            id: cartItem.id,
+            name: cartItem.name,
+            totalPrice: cartItem.totalPrice
+        }
+    };
+}
+
+// Handle remove from cart action
+function handleRemoveFromCartAction(action) {
+    debugLog('Removing from cart:', action);
+    
+    if (!action.item) {
+        console.error('No item specified for removal');
+        return { success: false, error: 'No item specified for removal' };
+    }
+    
+    // Find the item in the cart by name
+    const itemIndex = cart.findIndex(item => 
+        item.name && item.name.toLowerCase() === action.item.toLowerCase());
+    
+    if (itemIndex === -1) {
+        console.error('Item not found in cart:', action.item);
+        return { success: false, error: `Item "${action.item}" not found in cart` };
+    }
+    
+    const cartItem = cart[itemIndex];
+    
+    // Remove from cart
+    removeFromCart(cartItem.id);
+    
+    // Show confirmation
+    showRemovalConfirmation(cartItem);
+    
+    // Return success result
+    return { 
+        success: true, 
+        item: {
+            name: cartItem.name,
+            id: cartItem.id
+        }
+    };
+}
+
+// Handle clear cart action
+function handleClearCartAction() {
+    debugLog('Clearing cart');
+    
+    // Get cart size before clearing
+    const itemCount = cart.length;
+    
+    // Clear the cart
+    cart = [];
+    totalPrice = 0;
+    updateCartUI();
+    
+    // Show confirmation
+    showClearCartConfirmation();
+    
+    // Return success result
+    return { 
+        success: true, 
+        itemsRemoved: itemCount
+    };
+}
+
+// Handle checkout action
+function handleCheckoutAction(action) {
+    debugLog('Starting checkout:', action);
+    
+    // Show checkout form with provided info
+    const delivery = action.delivery !== undefined ? action.delivery : true;
+    const address = action.address || '';
+    const phone = action.phone || '';
+    
+    showCheckoutForm(delivery, address, phone);
+    
+    // Return success result
+    return { success: true };
+}
+
+// UI helpers
+function addMessageToTranscript(speaker, text) {
+    const transcript = document.getElementById('transcript');
+    const messageElement = document.createElement('div');
+    messageElement.classList.add('transcript-message', `${speaker}-message`);
+    messageElement.textContent = text;
+    transcript.appendChild(messageElement);
+    transcript.scrollTop = transcript.scrollHeight;
+}
+
+function updateStatus(message) {
+    document.getElementById('status').textContent = message;
+}
+
+function playAudio(base64Data, format) {
+    try {
+        console.log(`Attempting to play audio of format ${format}`);
+        console.log(`Audio data length: ${base64Data.length}`);
+        
+        // Create audio element
+        const audio = new Audio();
+        
+        // Set source
+        const dataUrl = `data:${format};base64,${base64Data}`;
+        audio.src = dataUrl;
+        
+        // Log when audio is loaded
+        audio.onloadeddata = () => {
+            console.log('Audio data loaded successfully');
+        };
+        
+        // Log play events
+        audio.onplay = () => {
+            console.log('Audio playback started');
+        };
+        
+        audio.onended = () => {
+            console.log('Audio playback ended');
+        };
+        
+        // Log errors
+        audio.onerror = (e) => {
+            console.error('Audio playback error:', e);
+            console.error('Error code:', audio.error ? audio.error.code : 'unknown');
+            console.error('Error message:', audio.error ? audio.error.message : 'unknown');
+        };
+        
+        // Try to play
+        audio.play().then(() => {
+            console.log('Audio playback initiated');
+        }).catch(error => {
+            console.error('Audio play() method rejected:', error);
+        });
+    } catch (error) {
+        console.error('Error setting up audio playback:', error);
+    }
+}
+
+// Initialize on page load
+window.addEventListener('load', initialize);
+</script>
 </body>
 </html>

@@ -1,12 +1,10 @@
-// server.js - OpenAI Realtime API with WebRTC implementation
+// server.js
 const express = require('express');
 const http = require('http');
 const WebSocket = require('ws');
 const path = require('path');
 const fs = require('fs');
 const dotenv = require('dotenv');
-const { v4: uuidv4 } = require('uuid');
-const fetch = require('node-fetch');
 
 // Load environment variables
 dotenv.config();
@@ -23,24 +21,389 @@ function debug(message, data) {
         }
     }
 }
-
-// Check for required environment variables
-if (!process.env.OPENAI_API_KEY) {
-    console.error('Missing OPENAI_API_KEY environment variable');
-    process.exit(1);
-}
-
-// Initialize Express app
+// Initialize Express app and HTTP server
 const app = express();
 const server = http.createServer(app);
+
+app.use(express.static(path.join(__dirname, 'public')));
+app.use(express.json());
+
+// Create WebSocket server
 const wss = new WebSocket.Server({ server });
 
-// Serve static files
-app.use(express.static(path.join(__dirname, 'public')));
-
 // Load restaurant data
-let restaurantData = null;
+const restaurantData = loadRestaurantData();
 
+// Store active client connections
+const clients = new Map();
+
+// Handle WebSocket connections from clients
+wss.on('connection', (ws) => {
+    console.log('Client connected');
+    
+    // Generate a unique client ID
+    const clientId = Date.now().toString();
+    
+    // Initialize client state
+    const clientState = {
+        id: clientId,
+        ws: ws,
+        openaiWs: null,
+        language: 'en',
+        cart: []
+    };
+    
+    // Store client state
+    clients.set(clientId, clientState);
+    
+    // Send initial message with client ID
+    ws.send(JSON.stringify({
+        type: 'connection',
+        id: clientId
+    }));
+    
+    // Handle messages from client
+    ws.on('message', async (message) => {
+        try {
+            const data = JSON.parse(message);
+            handleClientMessage(clientState, data);
+        } catch (error) {
+            console.error('Error handling client message:', error);
+            ws.send(JSON.stringify({
+                type: 'error',
+                error: error.message
+            }));
+        }
+    });
+    
+    // Handle client disconnection
+    ws.on('close', () => {
+        console.log(`Client ${clientId} disconnected`);
+        
+        // Close OpenAI connection if exists
+        if (clientState.openaiWs) {
+            clientState.openaiWs.close();
+        }
+        
+        // Remove client state
+        clients.delete(clientId);
+    });
+});
+
+// Handle client messages
+function handleClientMessage(clientState, message) {
+    switch (message.type) {
+        case 'init':
+            // Initialize OpenAI connection
+            initializeOpenAI(clientState, message.language || 'en');
+            break;
+            
+        case 'audio':
+            // Forward audio data to OpenAI
+            sendAudioToOpenAI(clientState, message.data);
+            break;
+            
+        case 'text':
+            // Send text message to OpenAI
+            sendTextToOpenAI(clientState, message.text);
+            break;
+            
+        case 'function_result':
+            // Handle function result
+            handleFunctionResult(clientState, message);
+            break;
+            
+        default:
+            console.warn('Unknown message type:', message.type);
+    }
+}
+
+// Initialize OpenAI WebSocket connection
+function initializeOpenAI(clientState, language) {
+    console.log(`Initializing OpenAI connection for client ${clientState.id} with language ${language}`);
+    
+    // Close existing connection if any
+    if (clientState.openaiWs) {
+        clientState.openaiWs.close();
+    }
+    
+    // Update language
+    clientState.language = language;
+    
+    // Get restaurant instructions
+    const instructions = language === 'ur' ? 
+        createUrduInstructions(restaurantData) : 
+        createEnglishInstructions(restaurantData);
+    
+    // Voice settings based on language
+    const voice = language === 'ur' ? 'alloy' : 'nova';
+    
+    // Try with recommended model for Realtime API
+    const model = 'gpt-4o-realtime-preview-2024-12-17'; // Use the recommended model from documentation
+    
+    console.log(`Connecting to OpenAI Realtime API with model: ${model}`);
+    
+    // Connect to OpenAI WebSocket with detailed logging
+    const openaiWs = new WebSocket(`wss://api.openai.com/v1/realtime?model=${model}`, {
+        headers: {
+            'Authorization': `Bearer ${process.env.OPENAI_API_KEY}`,
+            'OpenAI-Beta': 'realtime=v1'
+        }
+    });
+    
+    // Handle connection open
+    openaiWs.on('open', () => {
+        console.log(`OpenAI WebSocket connection opened for client ${clientState.id}`);
+        
+        // Store OpenAI WebSocket
+        clientState.openaiWs = openaiWs;
+        
+        // Get restaurant instructions
+        const instructions = clientState.language === 'ur' ? 
+            createUrduInstructions(restaurantData) : 
+            createEnglishInstructions(restaurantData);
+        
+        // Send initial system message with correct format
+        const initialMessage = {
+            type: "conversation.item.create",
+            item: {
+                type: "message",
+                role: "system",
+                content: [
+                    {
+                        type: "input_text",  // Changed from "text" to "input_text"
+                        text: instructions
+                    }
+                ]
+            }
+        };
+        
+        console.log('Sending system message:', JSON.stringify(initialMessage));
+        openaiWs.send(JSON.stringify(initialMessage));
+        
+        // Notify client
+        clientState.ws.send(JSON.stringify({
+            type: 'ready'
+        }));
+    });
+    
+    // Handle messages from OpenAI
+    openaiWs.on('message', (message) => {
+        console.log(`Received message from OpenAI (${typeof message}): ${typeof message === 'string' ? message.substring(0, 100) : `Binary data of length ${message.length}`}`);
+        
+        try {
+            // Try to parse as JSON if it's a string
+            if (typeof message === 'string') {
+                const data = JSON.parse(message);
+                console.log('Parsed message from OpenAI:', data);
+                
+                // Forward to client
+                clientState.ws.send(message);
+            } else {
+                // It's binary data - try to decode it as JSON first
+                try {
+                    const textData = message.toString('utf8');
+                    console.log('Converted binary to text:', textData.substring(0, 100));
+                    
+                    try {
+                        // Try to parse as JSON
+                        const jsonData = JSON.parse(textData);
+                        console.log('Successfully parsed binary data as JSON:', jsonData);
+                        
+                        // Forward JSON to client
+                        clientState.ws.send(JSON.stringify(jsonData));
+                        
+                        // Check if it's an error message
+                        if (jsonData.type === 'error') {
+                            console.error('Received error from OpenAI:', jsonData);
+                            
+                            // Close the connection if it's a terminal error
+                            if (jsonData.error && jsonData.error.message) {
+                                console.error('OpenAI error message:', jsonData.error.message);
+                            }
+                        }
+                    } catch (jsonError) {
+                        // Not valid JSON, might be actual binary data
+                        console.log('Binary data is not valid JSON, assuming it might be audio');
+                        
+                        // Forward as binary_data
+                        clientState.ws.send(JSON.stringify({
+                            type: 'binary_data',
+                            format: 'application/octet-stream', // Generic binary format
+                            data: message.toString('base64')
+                        }));
+                    }
+                } catch (textError) {
+                    console.error('Error converting binary to text:', textError);
+                    
+                    // Forward raw binary data
+                    clientState.ws.send(JSON.stringify({
+                        type: 'binary_data',
+                        format: 'application/octet-stream',
+                        data: message.toString('base64')
+                    }));
+                }
+            }
+        } catch (error) {
+            console.error('Error handling OpenAI message:', error);
+        }
+    });
+    
+    // Handle errors with detailed logging
+    openaiWs.on('error', (error) => {
+        console.error(`OpenAI WebSocket error for client ${clientState.id}:`, error);
+        console.error('Error details:', error.message);
+        console.error('Error stack:', error.stack);
+        
+        // Notify client
+        clientState.ws.send(JSON.stringify({
+            type: 'error',
+            error: {
+                message: `Error connecting to OpenAI: ${error.message}`
+            }
+        }));
+    });
+    
+    // Handle connection close with detailed logging
+    openaiWs.on('close', (code, reason) => {
+        console.log(`OpenAI WebSocket closed for client ${clientState.id}. Code: ${code}, Reason: ${reason || 'No reason provided'}`);
+        
+        // Clear ping interval
+        if (clientState.pingInterval) {
+            clearInterval(clientState.pingInterval);
+            clientState.pingInterval = null;
+        }
+        
+        // Try reconnecting if it was a normal closure or no reason was provided
+        if (code === 1000 || code === 1001) {
+            console.log('Attempting to reconnect in 2 seconds...');
+            
+            // Wait 2 seconds before reconnecting
+            setTimeout(() => {
+                if (clientState.ws.readyState === WebSocket.OPEN) {
+                    // Re-initialize OpenAI connection
+                    initializeOpenAI(clientState, clientState.language);
+                }
+            }, 2000);
+        } else {
+            // For other close codes, notify client of disconnection
+            clientState.ws.send(JSON.stringify({
+                type: 'disconnected',
+                code: code,
+                reason: reason || 'Connection closed'
+            }));
+        }
+        
+        // Clear OpenAI WebSocket
+        clientState.openaiWs = null;
+    });
+}
+
+let audioBuffer = [];
+let lastCommitTime = 0;
+const MIN_BUFFER_SIZE = 4096; // Minimum buffer size before sending
+const MIN_BUFFER_TIME = 500; // Minimum time between commits in ms
+
+// Send audio data to OpenAI
+function sendAudioToOpenAI(clientState, audioData) {
+    if (!clientState.openaiWs || clientState.openaiWs.readyState !== WebSocket.OPEN) {
+        console.warn(`Cannot send audio: No OpenAI connection for client ${clientState.id}`);
+        return;
+    }
+    
+    // Use the format for audio data with the correct parameter name
+    const message = {
+        type: "input_audio_buffer.append",
+        audio: audioData  // Changed from audio_data to audio
+    };
+    
+    console.log('Sending audio data to OpenAI');
+    clientState.openaiWs.send(JSON.stringify(message));
+    
+    // Then commit the buffer
+    const commitMessage = {
+        type: "input_audio_buffer.commit"
+    };
+    
+    console.log('Committing audio buffer');
+    clientState.openaiWs.send(JSON.stringify(commitMessage));
+}
+
+// Send text to OpenAI
+function sendTextToOpenAI(clientState, text) {
+    if (!clientState.openaiWs || clientState.openaiWs.readyState !== WebSocket.OPEN) {
+        console.warn(`Cannot send text: No OpenAI connection for client ${clientState.id}`);
+        return;
+    }
+    
+    // Use the correct format for text messages
+    const message = {
+        type: "conversation.item.create",
+        item: {
+            type: "message",
+            role: "user",
+            content: [
+                {
+                    type: "input_text",  // Changed from "text" to "input_text"
+                    text: text
+                }
+            ]
+        }
+    };
+    
+    console.log('Sending text message to OpenAI:', message);
+    clientState.openaiWs.send(JSON.stringify(message));
+}
+
+// Handle function calls from OpenAI
+function handleFunctionCall(clientState, functionCall) {
+    // Extract function details
+    const functionName = functionCall.function.name;
+    const functionArgs = JSON.parse(functionCall.function.arguments);
+    const functionId = functionCall.id;
+    
+    console.log(`Function call from OpenAI: ${functionName}`, functionArgs);
+    
+    // Forward to client for UI updates or local processing
+    clientState.ws.send(JSON.stringify({
+        type: 'function_call',
+        id: functionId,
+        name: functionName,
+        arguments: functionArgs
+    }));
+}function handleFunctionResult(clientState, message) {
+    if (!clientState.openaiWs || clientState.openaiWs.readyState !== WebSocket.OPEN) {
+        console.warn(`Cannot send function result: No OpenAI connection for client ${clientState.id}`);
+        return;
+    }
+    
+    // Send function result using the correct format
+    const functionResultMessage = {
+        type: "conversation.item.create",
+        item: {
+            type: "function",
+            name: message.name,
+            role: "function",
+            content: [
+                {
+                    type: "input_text",  // Changed from "text" to "input_text"
+                    text: JSON.stringify(message.result)
+                }
+            ]
+        }
+    };
+    
+    console.log('Sending function result to OpenAI:', functionResultMessage);
+    clientState.openaiWs.send(JSON.stringify(functionResultMessage));
+}
+
+// Start the server
+const PORT = process.env.PORT || 3000;
+server.listen(PORT, () => {
+    console.log(`Server running on port ${PORT}`);
+});
+
+// Helper functions for restaurant data handling
 function loadRestaurantData() {
     try {
         const dataPath = path.join(__dirname, 'public', 'restaurant-data.js');
@@ -69,172 +432,6 @@ function loadRestaurantData() {
     }
 }
 
-// Load restaurant data
-restaurantData = loadRestaurantData();
-
-// Create session and get signaling info
-async function createWebRTCSession() {
-    try {
-        const response = await fetch('https://api.openai.com/v1/realtime/sessions', {
-            method: 'POST',
-            headers: {
-                'Content-Type': 'application/json',
-                'Authorization': `Bearer ${process.env.OPENAI_API_KEY}`
-            },
-            body: JSON.stringify({
-                model: 'gpt-4o-mini-2024-07-18',
-                /* You can optionally specify a base64-encoded ICE server configuration here.
-                ice_servers: {
-                    urls: ['stun:stun.example.com:19302']
-                }
-                */
-            })
-        });
-        
-        if (!response.ok) {
-            const errorData = await response.json();
-            throw new Error(`Failed to create WebRTC session: ${JSON.stringify(errorData)}`);
-        }
-        
-        const sessionData = await response.json();
-        debug('WebRTC session created:', sessionData);
-        
-        return sessionData;
-    } catch (error) {
-        console.error('Error creating WebRTC session:', error);
-        throw error;
-    }
-}
-
-// Update session configuration
-async function updateSession(sessionId, language = 'en') {
-    try {
-        // Get restaurant instructions
-        const instructions = language === 'ur' ? 
-            createUrduInstructions(restaurantData) : 
-            createEnglishInstructions(restaurantData);
-        
-        // Voice settings based on language
-        const voice = language === 'ur' ? 'alloy' : 'nova';
-        
-        const response = await fetch(`https://api.openai.com/v1/realtime/sessions/${sessionId}`, {
-            method: 'POST',
-            headers: {
-                'Content-Type': 'application/json',
-                'Authorization': `Bearer ${process.env.OPENAI_API_KEY}`
-            },
-            body: JSON.stringify({
-                session_id: sessionId,
-                input_audio: {
-                    sampling_rate: 16000,
-                    encoding: 'linear16',
-                    stream_silence: true,
-                    echo_cancellation: true,
-                    noise_suppression: true,
-                    automatic_gain_control: true
-                },
-                input_audio_transcription: {
-                    model: 'whisper-1',
-                    language: language
-                },
-                vad: {
-                    enabled: true,
-                    threshold: 0.5,
-                    prefix_padding: 0.5,
-                    suffix_padding: 1.0,
-                    sliding_window_size: 0.2,
-                    max_silence_length_ms: 2000,
-                    minimum_utterance_length_ms: 500
-                },
-                output_audio: {
-                    voice: voice
-                },
-                tools: getRestaurantFunctions(),
-                system_message: {
-                    role: 'system',
-                    content: instructions
-                }
-            })
-        });
-        
-        if (!response.ok) {
-            const errorData = await response.json();
-            throw new Error(`Failed to update session: ${JSON.stringify(errorData)}`);
-        }
-        
-        const updateData = await response.json();
-        debug('Session updated:', updateData);
-        
-        return updateData;
-    } catch (error) {
-        console.error('Error updating session:', error);
-        throw error;
-    }
-}
-
-// Send a function response
-async function sendFunctionResponse(sessionId, functionCallId, functionName, result) {
-    try {
-        const response = await fetch(`https://api.openai.com/v1/realtime/sessions/${sessionId}/conversation/items`, {
-            method: 'POST',
-            headers: {
-                'Content-Type': 'application/json',
-                'Authorization': `Bearer ${process.env.OPENAI_API_KEY}`
-            },
-            body: JSON.stringify({
-                role: 'function',
-                name: functionName,
-                content: JSON.stringify(result),
-                previous_item_id: functionCallId
-            })
-        });
-        
-        if (!response.ok) {
-            const errorData = await response.json();
-            throw new Error(`Failed to send function response: ${JSON.stringify(errorData)}`);
-        }
-        
-        const responseData = await response.json();
-        debug('Function response sent:', responseData);
-        
-        return responseData;
-    } catch (error) {
-        console.error('Error sending function response:', error);
-        throw error;
-    }
-}
-
-// Send a text message
-async function sendTextMessage(sessionId, text) {
-    try {
-        const response = await fetch(`https://api.openai.com/v1/realtime/sessions/${sessionId}/conversation/items`, {
-            method: 'POST',
-            headers: {
-                'Content-Type': 'application/json',
-                'Authorization': `Bearer ${process.env.OPENAI_API_KEY}`
-            },
-            body: JSON.stringify({
-                role: 'user',
-                content: text
-            })
-        });
-        
-        if (!response.ok) {
-            const errorData = await response.json();
-            throw new Error(`Failed to send text message: ${JSON.stringify(errorData)}`);
-        }
-        
-        const responseData = await response.json();
-        debug('Text message sent:', responseData);
-        
-        return responseData;
-    } catch (error) {
-        console.error('Error sending text message:', error);
-        throw error;
-    }
-}
-
-// Create English instructions
 function createEnglishInstructions(data) {
     if (!data) {
         return "You are a helpful assistant for a pizza restaurant.";
@@ -285,8 +482,9 @@ You have access to functions that can add items to cart, modify items, remove it
 `;
 }
 
-// Create Urdu instructions
+// Create Urdu instructions (same as your existing function)
 function createUrduInstructions(data) {
+    // Your existing implementation
     if (!data) {
         return "آپ ایک پیزا ریستوراں کے لیے ایک مددگار اسسٹنٹ ہیں۔";
     }
@@ -462,74 +660,3 @@ function getRestaurantFunctions() {
         }
     ];
 }
-
-// Store active clients
-const clients = new Map();
-
-// Create route to generate WebRTC session info
-app.get('/api/create-session', async (req, res) => {
-    try {
-        const sessionData = await createWebRTCSession();
-        res.json(sessionData);
-    } catch (error) {
-        console.error('Error creating session:', error);
-        res.status(500).json({ error: error.message });
-    }
-});
-
-// Route to update session
-app.post('/api/update-session', express.json(), async (req, res) => {
-    try {
-        const { sessionId, language } = req.body;
-        
-        if (!sessionId) {
-            return res.status(400).json({ error: 'Session ID is required' });
-        }
-        
-        const updateData = await updateSession(sessionId, language || 'en');
-        res.json(updateData);
-    } catch (error) {
-        console.error('Error updating session:', error);
-        res.status(500).json({ error: error.message });
-    }
-});
-
-// Route to send function response
-app.post('/api/function-response', express.json(), async (req, res) => {
-    try {
-        const { sessionId, functionCallId, functionName, result } = req.body;
-        
-        if (!sessionId || !functionCallId || !functionName) {
-            return res.status(400).json({ error: 'Missing required parameters' });
-        }
-        
-        const responseData = await sendFunctionResponse(sessionId, functionCallId, functionName, result);
-        res.json(responseData);
-    } catch (error) {
-        console.error('Error sending function response:', error);
-        res.status(500).json({ error: error.message });
-    }
-});
-
-// Route to send text message
-app.post('/api/send-text', express.json(), async (req, res) => {
-    try {
-        const { sessionId, text } = req.body;
-        
-        if (!sessionId || !text) {
-            return res.status(400).json({ error: 'Missing required parameters' });
-        }
-        
-        const responseData = await sendTextMessage(sessionId, text);
-        res.json(responseData);
-    } catch (error) {
-        console.error('Error sending text message:', error);
-        res.status(500).json({ error: error.message });
-    }
-});
-
-// Start the server
-const PORT = process.env.PORT || 3000;
-server.listen(PORT, () => {
-    console.log(`Server running on port ${PORT}`);
-});
